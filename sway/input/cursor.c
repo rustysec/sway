@@ -449,17 +449,25 @@ static void dispatch_cursor_button_floating(struct sway_cursor *cursor,
 	bool over_title = edge == WLR_EDGE_NONE && !surface;
 
 	// Check for beginning move
-	if (button == BTN_LEFT && state == WLR_BUTTON_PRESSED &&
+	uint32_t btn_move = config->floating_mod_inverse ? BTN_RIGHT : BTN_LEFT;
+	if (button == btn_move && state == WLR_BUTTON_PRESSED &&
 			(mod_pressed || over_title)) {
-		seat_begin_move(seat, cont, BTN_LEFT);
+		seat_begin_move(seat, cont, button);
 		return;
 	}
 
 	// Check for beginning resize
 	bool resizing_via_border = button == BTN_LEFT && edge != WLR_EDGE_NONE;
-	bool resizing_via_mod = button == BTN_RIGHT && mod_pressed;
+	uint32_t btn_resize = config->floating_mod_inverse ? BTN_LEFT : BTN_RIGHT;
+	bool resizing_via_mod = button == btn_resize && mod_pressed;
 	if ((resizing_via_border || resizing_via_mod) &&
 			state == WLR_BUTTON_PRESSED) {
+		if (edge == WLR_EDGE_NONE) {
+			edge |= cursor->cursor->x > cont->x + cont->width / 2 ?
+				WLR_EDGE_RIGHT : WLR_EDGE_LEFT;
+			edge |= cursor->cursor->y > cont->y + cont->height / 2 ?
+				WLR_EDGE_BOTTOM : WLR_EDGE_TOP;
+		}
 		seat_begin_resize(seat, cont, button, edge);
 		return;
 	}
@@ -467,6 +475,83 @@ static void dispatch_cursor_button_floating(struct sway_cursor *cursor,
 	// Send event to surface
 	seat_set_focus(seat, cont);
 	seat_pointer_notify_button(seat, time_msec, button, state);
+}
+
+/**
+ * Remove a button (and duplicates) to the sorted list of currently pressed buttons
+ */
+static void state_erase_button(struct sway_cursor *cursor, uint32_t button) {
+	size_t j = 0;
+	for (size_t i = 0; i < cursor->pressed_button_count; ++i) {
+		if (i > j) {
+			cursor->pressed_buttons[j] = cursor->pressed_buttons[i];
+		}
+		if (cursor->pressed_buttons[i] != button) {
+			++j;
+		}
+	}
+	while (cursor->pressed_button_count > j) {
+		--cursor->pressed_button_count;
+		cursor->pressed_buttons[cursor->pressed_button_count] = 0;
+	}
+}
+
+/**
+ * Add a button to the sorted list of currently pressed buttons, if there
+ * is space.
+ */
+static void state_add_button(struct sway_cursor *cursor, uint32_t button) {
+	if (cursor->pressed_button_count >= SWAY_CURSOR_PRESSED_BUTTONS_CAP) {
+		return;
+	}
+	size_t i = 0;
+	while (i < cursor->pressed_button_count && cursor->pressed_buttons[i] < button) {
+		++i;
+	}
+	size_t j = cursor->pressed_button_count;
+	while (j > i) {
+		cursor->pressed_buttons[j] = cursor->pressed_buttons[j - 1];
+		--j;
+	}
+	cursor->pressed_buttons[i] = button;
+	cursor->pressed_button_count++;
+}
+
+/**
+ * Return the mouse binding which matches modifier, click location, release,
+ * and pressed button state, otherwise return null.
+ */
+static struct sway_binding* get_active_mouse_binding(const struct sway_cursor *cursor,
+		list_t *bindings, uint32_t modifiers, bool release, bool on_titlebar,
+				     bool on_border, bool on_content) {
+	uint32_t click_region = (on_titlebar ? BINDING_TITLEBAR : 0) |
+			(on_border ? BINDING_BORDER : 0) |
+			(on_content ? BINDING_CONTENTS : 0);
+
+	for (int i = 0; i < bindings->length; ++i) {
+		struct sway_binding *binding = bindings->items[i];
+		if (modifiers ^ binding->modifiers ||
+				cursor->pressed_button_count != (size_t)binding->keys->length ||
+				release != (binding->flags & BINDING_RELEASE) ||
+				!(click_region & binding->flags)) {
+			continue;
+		}
+
+		bool match = true;
+		for (size_t j = 0; j < cursor->pressed_button_count; j++) {
+			uint32_t key = *(uint32_t *)binding->keys->items[j];
+			if (key != cursor->pressed_buttons[j]) {
+				match = false;
+				break;
+			}
+		}
+		if (!match) {
+			continue;
+		}
+
+		return binding;
+	}
+	return NULL;
 }
 
 void dispatch_cursor_button(struct sway_cursor *cursor,
@@ -485,6 +570,31 @@ void dispatch_cursor_button(struct sway_cursor *cursor,
 	double sx, sy;
 	struct sway_container *cont = container_at_coords(cursor->seat,
 			cursor->cursor->x, cursor->cursor->y, &surface, &sx, &sy);
+
+	// Handle mouse bindings
+	bool on_border = cont && (find_resize_edge(cont, cursor) != WLR_EDGE_NONE);
+	bool on_contents = !on_border && surface;
+	bool on_titlebar = !on_border && !surface;
+	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(cursor->seat->wlr_seat);
+	uint32_t modifiers = keyboard ? wlr_keyboard_get_modifiers(keyboard) : 0;
+
+	struct sway_binding *binding = NULL;
+	if (state == WLR_BUTTON_PRESSED) {
+		state_add_button(cursor, button);
+		binding = get_active_mouse_binding(cursor,
+			config->current_mode->mouse_bindings, modifiers, false,
+			on_titlebar, on_border, on_contents);
+	} else {
+		binding = get_active_mouse_binding(cursor,
+			config->current_mode->mouse_bindings, modifiers, true,
+			on_titlebar, on_border, on_contents);
+		state_erase_button(cursor, button);
+	}
+	if (binding) {
+		seat_execute_command(cursor->seat, binding);
+		// TODO: do we want to pass on the event?
+	}
+
 	if (surface && wlr_surface_is_layer_surface(surface)) {
 		struct wlr_layer_surface *layer =
 			wlr_layer_surface_from_wlr_surface(surface);
